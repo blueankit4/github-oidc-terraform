@@ -1,0 +1,110 @@
+name: "Terraform action" # The name of the workflow displayed in the GitHub Actions interface.
+
+on: # Defines the events that trigger the workflow.
+  push: # Trigger when code is pushed to a branch.
+    branches: # Specify which branches trigger the workflow.
+      - main # Trigger only for the main branch.
+  pull_request: # Also trigger the workflow when a pull request is created.
+
+permissions: # Define permissions required for this workflow.
+  id-token: write # Required to authenticate with AWS using OIDC.
+  contents: read # Needed for the `actions/checkout` to pull the repository code.
+  pull-requests: write # Allows the workflow to add comments on pull requests.
+
+env: # Environment variables accessible in the workflow.
+  TF_LOG: INFO # Set Terraform logging level to INFO for debugging.
+  AWS_REGION: ${{ secrets.AWS_REGION }} # AWS region fetched from GitHub secrets.
+
+jobs: # Define the jobs (logical units of work) in the workflow.
+  deploy: # Job name, in this case "deploy".
+    runs-on: ubuntu-latest # Specifies the OS and environment for the job (Ubuntu in this case).
+
+    defaults: # Default settings applied to all steps in the job.
+      run:
+        shell: bash # Use Bash shell for running commands.
+        working-directory: . # Run commands in the root of the repository.
+
+    steps: # Define the individual steps of the job.
+      - name: Git checkout # Step 1: Checkout the repository code.
+        uses: actions/checkout@v3 # Use the GitHub action to fetch the repository files.
+
+      - name: Configure AWS credentials from AWS account # Step 2: Authenticate with AWS using OIDC.
+        uses: aws-actions/configure-aws-credentials@v1 # Use AWS GitHub Action to set credentials.
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE }} # Role ARN for assuming permissions.
+          aws-region: ${{ secrets.AWS_REGION }} # AWS region.
+          role-session-name: GitHub-OIDC-TERRAFORM # A session name for tracking in AWS logs.
+
+      - name: Setup Terraform # Step 3: Setup Terraform CLI.
+        uses: hashicorp/setup-terraform@v2 # Use HashiCorp's Terraform action.
+        with:
+          terraform_version: 1.2.5 # Specify the Terraform version to install.
+
+      - name: Terraform fmt # Step 4: Check Terraform formatting.
+        id: fmt # Assign an ID for reference in later steps.
+        run: terraform fmt -check # Validate that Terraform files are formatted correctly.
+        continue-on-error: true # Continue workflow even if formatting fails.
+
+      - name: Terraform Init # Step 5: Initialize Terraform backend.
+        id: init # Assign an ID for reference.
+        env:
+          AWS_BUCKET_NAME: ${{ secrets.AWS_BUCKET_NAME }} # Name of the S3 bucket for storing Terraform state.
+          AWS_BUCKET_KEY_NAME: ${{ secrets.AWS_BUCKET_KEY_NAME }} # Key for the state file.
+        run: terraform init -backend-config="bucket=${AWS_BUCKET_NAME}" \
+          -backend-config="key=${AWS_BUCKET_KEY_NAME}" \
+          -backend-config="region=${AWS_REGION}" # Initialize Terraform with S3 backend for state storage.
+
+      - name: Terraform Validate # Step 6: Validate the Terraform configuration.
+        id: validate # Assign an ID for reference.
+        run: terraform validate -no-color # Run validation and disable color codes for logs.
+
+      - name: Terraform Plan # Step 7: Create a Terraform execution plan.
+        id: plan # Assign an ID for reference.
+        run: terraform plan -no-color # Run `terraform plan` and disable color codes.
+        if: github.event_name == 'pull_request' # Run this step only for pull requests.
+        continue-on-error: true # Continue workflow even if this step fails.
+
+      - uses: actions/github-script@v6 # Step 8: Use a GitHub Action to comment the plan output on the pull request.
+        if: github.event_name == 'pull_request' # Only execute this for pull requests.
+        env:
+          PLAN: "terraform\n${{ steps.plan.outputs.stdout }}" # Store the Terraform plan output.
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }} # Use GitHub token for authentication.
+          script: | # Custom script for generating and posting the PR comment.
+            const output = `#### Terraform Format and Style 🖌\`${{ steps.fmt.outcome }}\`
+            #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+            #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+            <details><summary>Validation Output</summary>
+
+            \`\`\`\n
+            ${{ steps.validate.outputs.stdout }}
+            \`\`\`
+
+            </details>
+
+            #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`\n
+            ${process.env.PLAN}
+            \`\`\`
+
+            </details>
+
+            *Pushed by: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number, # Pull request number.
+              owner: context.repo.owner, # Repository owner.
+              repo: context.repo.repo, # Repository name.
+              body: output # The generated comment content.
+            })
+
+      - name: Terraform Plan Status # Step 9: Fail workflow if Terraform plan failed.
+        if: steps.plan.outcome == 'failure' # Check if the `plan` step failed.
+        run: exit 1 # Exit the workflow with a failure code.
+
+      - name: Terraform Apply # Step 10: Apply Terraform changes for the main branch.
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push' # Run only on `main` branch pushes.
+        run: terraform apply -auto-approve -input=false # Apply changes automatically without manual approval.
